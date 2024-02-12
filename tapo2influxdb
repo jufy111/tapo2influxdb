@@ -1,0 +1,126 @@
+import time
+from datetime import datetime
+import influxdb.exceptions as inexc
+import PyP100
+from PyP100 import PyP110
+from influxdb_client import InfluxDBClient, Point, WritePrecision
+from influxdb_client.client.write_api import WriteOptions, SYNCHRONOUS
+import logging
+import sys
+
+
+
+# Import the entire configuration dictionary from config.py
+from config import sensor_data, influxdb_config, tapo_config, other_config
+
+# Unpack the configuration variables from the dictionaries
+token = influxdb_config['token']
+org = influxdb_config['org']
+bucket = influxdb_config['bucket']
+dburl = influxdb_config['dburl']
+
+tapo_username = tapo_config['username']
+tapo_password = tapo_config['password']
+
+sample_time = other_config['sample_time']
+timeout_time = other_config['timeout_time']
+
+
+
+#write to DB options
+client = InfluxDBClient(url=dburl, token=token)
+write_api = client.write_api(write_options=WriteOptions(batch_size=100, flush_interval=5000))
+
+# Configure logging
+logging.basicConfig(filename='error_log.txt', level=logging.ERROR, format='%(asctime)s - %(levelname)s - %(message)s')
+
+tapo_init=[]
+def init():
+
+    for sensor_name in sensor_data:
+        tapo_init.append({'label':sensor_name['name'], 'tapo_data':PyP110.P110(sensor_name['ip'], tapo_username, tapo_password)})
+    print(tapo_init)
+
+
+
+#Main loop
+def main():
+    while True:
+        try:
+            #query each sensor iteritivly
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+            sensor_data_list=[]
+            all_data_points = []
+
+            for sensor in tapo_init:
+                sensor['tapo_data'].handshake()
+                sensor['tapo_data'].login()
+                raw_data = sensor['tapo_data'].getEnergyUsage()
+                sensor_data_list.append({'name':sensor['label'], 'power':raw_data['result']['current_power'] / 1000.0})
+                print("")
+            all_data_points = format_influx(sensor_data_list)
+            write_database(client, all_data_points,write_api)
+
+            # Print the timestamp and sensor data after writing to the database
+            print(f"Timestamp: {timestamp}")
+            print('-' * 40)
+            for data in sensor_data_list:
+                if data is not None:
+                    power_value = f"{data['power']} W"
+                    print(f"{data['name']:15} | {power_value:<10}")
+                else:
+                    print(f"{data['name']:15} | {'offline':<10}")
+
+            # Add a blank line after each interval
+            print()
+        except Exception as e:
+            logging.error(f"An error occurred: {e}")
+
+    # Clear printout memory and wait for sample time before the next iteration
+    sys.stdout.flush()
+    time.sleep(sample_time - time.monotonic() % sample_time)
+    return
+
+
+
+#Formats data so it can be pushed to the influxDB intance
+def format_influx(sensor_data_list):
+    all_data_points = []
+    for data in sensor_data_list:
+        if data is None:
+            continue
+
+        data_points = [
+            Point.measurement(data['name']).field('Power', data['power']).time(datetime.utcnow(), WritePrecision.NS)
+        ]
+        all_data_points.extend(data_points)
+    return(all_data_points)
+      
+
+
+#Writes data to influxDB (2.0+)
+def write_database(client, all_data_points, write_api):
+    try:        
+        write_api.write(bucket=bucket, org=org, record=all_data_points)
+        return
+    except Exception as e:
+        logging.error(f"Error writing data to InfluxDB: {e}")
+        return
+    return
+#Initilize code + exeption handling
+
+
+if __name__ == "__main__":
+    init()
+    main()
+    while True:
+        try:
+            main()
+        except KeyboardInterrupt:
+            print("Program stopped by keyboard interrupt [CTRL_C] by user.")
+            break  # Exit the outer loop on keyboard interrupt
+        except Exception as e:
+            logging.error(f"An error occurred: {e}")
+            time.sleep(sample_time)  # Add a sleep to prevent constant looping in case of errors
+
+        
